@@ -4,6 +4,7 @@ Supply-chain risk auditor for dependency upgrades. Analyzes version transitions 
 
 ## Prerequisites
 
+- **go** — Go toolchain (used for module resolution and integrity verification via `go mod download`)
 - **gh** — GitHub CLI, authenticated
 - **copilot** — GitHub Copilot CLI (used via the Copilot SDK)
 
@@ -188,12 +189,16 @@ Integrity hashes are automatically extracted from the `go.sum` diff and passed t
 
 ## Supported ecosystems
 
-| Language | Manifest | Lock file | Registry |
-|----------|----------|-----------|----------|
-| Go | `go.mod` | `go.sum` | proxy.golang.org / sum.golang.org |
+| Language | Manifest | Lock file | Toolchain | Registry |
+|----------|----------|-----------|-----------|----------|
+| Go | `go.mod` | `go.sum` | `go mod download -json` | Honors `GOPROXY`, `GOPRIVATE`, `GOSUMDB` |
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
+| `GOPROXY` | Go module proxy list (respected via `go mod download`) |
+| `GOPRIVATE` | Modules that should bypass the proxy and checksum DB |
+| `GOSUMDB` | Go checksum database URL |
+| `GONOSUMCHECK` | Modules to skip checksum verification for |
 | `COPILOT_CLI_PATH` | Path to the Copilot CLI executable (optional) |

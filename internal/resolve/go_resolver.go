@@ -1,94 +1,105 @@
 package resolve
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"os/exec"
 	"strings"
 
 	"github.com/anomalyco/deps-check/internal/model"
 )
 
-// GoResolver resolves Go module paths to their source repositories
-// by querying the Go module proxy (proxy.golang.org).
-type GoResolver struct {
-	// ProxyURL is the base URL of the Go module proxy.
-	// Defaults to "https://proxy.golang.org" if empty.
-	ProxyURL string
-
-	// SumURL is the base URL of the Go checksum database.
-	// Defaults to "https://sum.golang.org" if empty.
-	SumURL string
-}
+// GoResolver resolves Go module paths to their source repositories and
+// validates integrity hashes by delegating to the Go toolchain.
+//
+// All operations use `go mod download -json`, which automatically honors
+// the user's Go environment: GOPROXY, GOPRIVATE, GONOPROXY, GONOSUMDB,
+// GOSUMDB, GONOSUMCHECK, and module path escaping.
+type GoResolver struct{}
 
 func (r *GoResolver) Language() string { return "go" }
 
-// proxyInfoResponse is the JSON structure returned by the Go module proxy
-// for /<module>/@v/<version>.info requests.
-type proxyInfoResponse struct {
-	Version string `json:"Version"`
-	Origin  *struct {
-		VCS  string `json:"VCS"`
-		URL  string `json:"URL"`
-		Ref  string `json:"Ref"`
-		Hash string `json:"Hash"`
-	} `json:"Origin"`
+// goModDownload is the JSON structure returned by `go mod download -json`.
+type goModDownload struct {
+	Path     string       `json:"Path"`
+	Version  string       `json:"Version"`
+	Info     string       `json:"Info"`
+	GoMod    string       `json:"GoMod"`
+	Zip      string       `json:"Zip"`
+	Dir      string       `json:"Dir"`
+	Sum      string       `json:"Sum"`
+	GoModSum string       `json:"GoModSum"`
+	Error    string       `json:"Error"`
+	Origin   *goModOrigin `json:"Origin"`
+}
+
+type goModOrigin struct {
+	VCS  string `json:"VCS"`
+	URL  string `json:"URL"`
+	Hash string `json:"Hash"`
+	Ref  string `json:"Ref"`
+}
+
+// download runs `go mod download -json <module>@<version>` and returns the
+// parsed result. It inherits the caller's environment, so GOPROXY, GOPRIVATE,
+// GONOSUMDB, etc. are all respected.
+func (r *GoResolver) download(ctx context.Context, module, version string) (*goModDownload, error) {
+	arg := module + "@" + version
+	cmd := exec.CommandContext(ctx, "go", "mod", "download", "-json", arg)
+	out, err := cmd.Output()
+	if err != nil {
+		// If the command produced output, it may contain a JSON error.
+		if len(out) > 0 {
+			var dl goModDownload
+			if jsonErr := json.Unmarshal(out, &dl); jsonErr == nil && dl.Error != "" {
+				return nil, fmt.Errorf("go mod download %s: %s", arg, dl.Error)
+			}
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("go mod download %s: %w\n%s", arg, err, exitErr.Stderr)
+		}
+		return nil, fmt.Errorf("go mod download %s: %w", arg, err)
+	}
+
+	var dl goModDownload
+	if err := json.Unmarshal(out, &dl); err != nil {
+		return nil, fmt.Errorf("parsing go mod download output: %w", err)
+	}
+
+	if dl.Error != "" {
+		return nil, fmt.Errorf("go mod download %s: %s", arg, dl.Error)
+	}
+
+	return &dl, nil
 }
 
 func (r *GoResolver) Resolve(ctx context.Context, module string, version string) (*ResolvedPackage, error) {
-	base := r.ProxyURL
-	if base == "" {
-		base = "https://proxy.golang.org"
-	}
-
-	// The proxy expects module paths to be lowercased with uppercase letters
-	// escaped as !<lower>. For simplicity (most modules are lowercase), we
-	// use the path directly. A production implementation would apply proper escaping.
-	url := fmt.Sprintf("%s/%s/@v/%s.info", base, module, version)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	dl, err := r.download(ctx, module, version)
 	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
+		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("querying Go module proxy: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Go module proxy returned %d for %s@%s", resp.StatusCode, module, version)
+	if dl.Origin == nil || dl.Origin.URL == "" {
+		return nil, fmt.Errorf("no origin URL in go mod download response for %s@%s", module, version)
 	}
 
-	var info proxyInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return nil, fmt.Errorf("decoding proxy response: %w", err)
-	}
-
-	if info.Origin == nil || info.Origin.URL == "" {
-		return nil, fmt.Errorf("no origin URL in proxy response for %s@%s", module, version)
-	}
-
-	repo, err := parseGitHubURL(info.Origin.URL)
+	repo, err := parseGitHubURL(dl.Origin.URL)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ResolvedPackage{
-		Module:  module,
+		Module:  dl.Path,
 		Repo:    repo,
-		VCS:     info.Origin.VCS,
-		RepoURL: info.Origin.URL,
+		VCS:     dl.Origin.VCS,
+		RepoURL: dl.Origin.URL,
 	}, nil
 }
 
 // parseGitHubURL extracts owner/repo from a GitHub URL.
 // Supports https://github.com/owner/repo and https://github.com/owner/repo.git
 func parseGitHubURL(rawURL string) (model.RepoRef, error) {
-	// Strip scheme.
 	u := rawURL
 	u = strings.TrimPrefix(u, "https://")
 	u = strings.TrimPrefix(u, "http://")
@@ -98,7 +109,6 @@ func parseGitHubURL(rawURL string) (model.RepoRef, error) {
 		return model.RepoRef{}, fmt.Errorf("not a GitHub repository: %s", rawURL)
 	}
 
-	// "github.com/owner/repo" → ["github.com", "owner", "repo"]
 	parts := strings.SplitN(u, "/", 4)
 	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
 		return model.RepoRef{}, fmt.Errorf("cannot parse GitHub owner/repo from %s", rawURL)
@@ -107,61 +117,22 @@ func parseGitHubURL(rawURL string) (model.RepoRef, error) {
 	return model.RepoRef{Owner: parts[1], Repo: parts[2]}, nil
 }
 
-// ValidateIntegrity fetches the integrity hashes for a Go module version from
-// the Go checksum database (sum.golang.org) and validates localHash against
-// the remote hash. If localHash is empty, the result status is IntegritySkipped.
-//
-// The checksum DB returns lines like:
-//
-//	github.com/foo/bar v1.0.0 h1:<base64>=
-//	github.com/foo/bar v1.0.0/go.mod h1:<base64>=
+// ValidateIntegrity downloads the module via `go mod download -json` and
+// compares the resulting Sum (which the Go toolchain verified against the
+// configured checksum database) with the user-provided localHash.
 func (r *GoResolver) ValidateIntegrity(ctx context.Context, module, version, localHash string) (*IntegrityResult, error) {
-	base := r.SumURL
-	if base == "" {
-		base = "https://sum.golang.org"
-	}
-
-	url := fmt.Sprintf("%s/lookup/%s@%s", base, module, version)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	dl, err := r.download(ctx, module, version)
 	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
+		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("querying Go checksum DB: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Go checksum DB returned %d for %s@%s", resp.StatusCode, module, version)
-	}
-
-	// Parse the response line by line. The first few lines contain the hashes:
-	//   <module> <version> h1:<hash>=
-	//   <module> <version>/go.mod h1:<hash>=
-	remote := RemoteIntegrity{}
-	prefix := fmt.Sprintf("%s %s ", module, version)
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, prefix) {
-			rest := strings.TrimPrefix(line, prefix)
-			if strings.HasPrefix(rest, "h1:") {
-				remote.Hash = rest
-			} else if strings.HasPrefix(rest, "/go.mod h1:") {
-				remote.ModHash = strings.TrimPrefix(rest, "/go.mod ")
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading checksum DB response: %w", err)
+	remote := RemoteIntegrity{
+		Hash:    dl.Sum,
+		ModHash: dl.GoModSum,
 	}
 
 	if remote.Hash == "" {
-		return nil, fmt.Errorf("no hash found in checksum DB for %s@%s", module, version)
+		return nil, fmt.Errorf("no hash returned by go mod download for %s@%s", module, version)
 	}
 
 	result := &IntegrityResult{
