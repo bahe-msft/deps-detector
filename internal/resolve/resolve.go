@@ -10,7 +10,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // Resolver discovers the source repository for a package in a specific ecosystem.

@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // GoResolver resolves Go module paths to their source repositories and

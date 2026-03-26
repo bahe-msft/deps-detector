@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anomalyco/deps-check/internal/github"
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/github"
+	"deps-detector/internal/model"
 )
 
 // Diff fetches the file-level diff between two tags, including patches.

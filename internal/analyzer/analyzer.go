@@ -11,7 +11,7 @@ package analyzer
 import (
 	"context"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // SourceAnalysis holds the free-form text output from a sub-task agent.

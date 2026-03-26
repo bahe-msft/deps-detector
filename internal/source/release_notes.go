@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/anomalyco/deps-check/internal/github"
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/github"
+	"deps-detector/internal/model"
 )
 
 // ReleaseNotes fetches GitHub release notes for both the from and to versions.

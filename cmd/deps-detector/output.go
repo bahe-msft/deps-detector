@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 func printResult(vr model.VersionRange, result *model.AnalysisResult) {

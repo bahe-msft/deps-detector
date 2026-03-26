@@ -10,7 +10,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // Client wraps GitHub API access via the gh CLI.

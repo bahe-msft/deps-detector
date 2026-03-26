@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anomalyco/deps-check/internal/github"
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/github"
+	"deps-detector/internal/model"
 )
 
 // Commits fetches the list of commits between two tags.

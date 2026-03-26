@@ -9,7 +9,7 @@ import (
 
 	copilot "github.com/github/copilot-sdk/go"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // sendPrompt creates a Copilot session with the given system prompt,

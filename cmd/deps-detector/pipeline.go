@@ -8,11 +8,11 @@ import (
 
 	copilot "github.com/github/copilot-sdk/go"
 
-	"github.com/anomalyco/deps-check/internal/analyzer"
-	"github.com/anomalyco/deps-check/internal/github"
-	"github.com/anomalyco/deps-check/internal/model"
-	"github.com/anomalyco/deps-check/internal/resolve"
-	"github.com/anomalyco/deps-check/internal/source"
+	"deps-detector/internal/analyzer"
+	"deps-detector/internal/github"
+	"deps-detector/internal/model"
+	"deps-detector/internal/resolve"
+	"deps-detector/internal/source"
 )
 
 // verifyParams holds all parameters needed by the verification pipeline.

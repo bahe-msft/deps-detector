@@ -10,8 +10,8 @@ import (
 	copilot "github.com/github/copilot-sdk/go"
 	"github.com/spf13/cobra"
 
-	"github.com/anomalyco/deps-check/internal/diffparse"
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/diffparse"
+	"deps-detector/internal/model"
 )
 
 // fromDiffFlags holds the flags for the from-diff command.

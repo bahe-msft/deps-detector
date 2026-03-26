@@ -6,7 +6,7 @@ import (
 
 	copilot "github.com/github/copilot-sdk/go"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 //go:embed assets/prompt_release_notes.txt

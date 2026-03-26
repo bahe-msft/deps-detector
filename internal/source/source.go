@@ -4,7 +4,7 @@ package source
 import (
 	"context"
 
-	"github.com/anomalyco/deps-check/internal/model"
+	"deps-detector/internal/model"
 )
 
 // InfoSource gathers change intelligence for a dependency version range.

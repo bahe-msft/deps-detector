@@ -1,4 +1,4 @@
-module github.com/anomalyco/deps-check
+module deps-detector
 
 go 1.24
 
