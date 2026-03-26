@@ -25,6 +25,25 @@ func (r RepoRef) String() string {
 	return fmt.Sprintf("%s/%s", r.Owner, r.Repo)
 }
 
+// IntegrityStatus represents the outcome of an integrity check.
+type IntegrityStatus string
+
+const (
+	IntegrityMatch    IntegrityStatus = "match"    // provided == remote
+	IntegrityMismatch IntegrityStatus = "mismatch" // provided != remote — possible retagging
+	IntegritySkipped  IntegrityStatus = "skipped"  // no integrity value provided by user
+)
+
+// IntegrityCheck records the result of comparing a user-provided integrity
+// hash against the remote registry's integrity hash for a specific version.
+type IntegrityCheck struct {
+	Version   string          `json:"version"`
+	Status    IntegrityStatus `json:"status"`
+	Local     string          `json:"local,omitempty"`      // user-provided hash (empty if skipped)
+	Remote    string          `json:"remote,omitempty"`     // hash from the registry
+	RemoteMod string          `json:"remote_mod,omitempty"` // go.mod hash from the registry
+}
+
 // ChangeReport is the raw intelligence gathered by a single InfoSource.
 type ChangeReport struct {
 	Source string            `json:"source"` // human-readable name of the source, e.g. "release_notes"

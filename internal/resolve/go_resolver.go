@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,10 @@ type GoResolver struct {
 	// ProxyURL is the base URL of the Go module proxy.
 	// Defaults to "https://proxy.golang.org" if empty.
 	ProxyURL string
+
+	// SumURL is the base URL of the Go checksum database.
+	// Defaults to "https://sum.golang.org" if empty.
+	SumURL string
 }
 
 func (r *GoResolver) Language() string { return "go" }
@@ -100,4 +105,78 @@ func parseGitHubURL(rawURL string) (model.RepoRef, error) {
 	}
 
 	return model.RepoRef{Owner: parts[1], Repo: parts[2]}, nil
+}
+
+// ValidateIntegrity fetches the integrity hashes for a Go module version from
+// the Go checksum database (sum.golang.org) and validates localHash against
+// the remote hash. If localHash is empty, the result status is IntegritySkipped.
+//
+// The checksum DB returns lines like:
+//
+//	github.com/foo/bar v1.0.0 h1:<base64>=
+//	github.com/foo/bar v1.0.0/go.mod h1:<base64>=
+func (r *GoResolver) ValidateIntegrity(ctx context.Context, module, version, localHash string) (*IntegrityResult, error) {
+	base := r.SumURL
+	if base == "" {
+		base = "https://sum.golang.org"
+	}
+
+	url := fmt.Sprintf("%s/lookup/%s@%s", base, module, version)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("querying Go checksum DB: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Go checksum DB returned %d for %s@%s", resp.StatusCode, module, version)
+	}
+
+	// Parse the response line by line. The first few lines contain the hashes:
+	//   <module> <version> h1:<hash>=
+	//   <module> <version>/go.mod h1:<hash>=
+	remote := RemoteIntegrity{}
+	prefix := fmt.Sprintf("%s %s ", module, version)
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, prefix) {
+			rest := strings.TrimPrefix(line, prefix)
+			if strings.HasPrefix(rest, "h1:") {
+				remote.Hash = rest
+			} else if strings.HasPrefix(rest, "/go.mod h1:") {
+				remote.ModHash = strings.TrimPrefix(rest, "/go.mod ")
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading checksum DB response: %w", err)
+	}
+
+	if remote.Hash == "" {
+		return nil, fmt.Errorf("no hash found in checksum DB for %s@%s", module, version)
+	}
+
+	result := &IntegrityResult{
+		Local:  localHash,
+		Remote: remote,
+	}
+
+	switch {
+	case localHash == "":
+		result.Status = model.IntegritySkipped
+	case localHash == remote.Hash:
+		result.Status = model.IntegrityMatch
+	default:
+		result.Status = model.IntegrityMismatch
+	}
+
+	return result, nil
 }

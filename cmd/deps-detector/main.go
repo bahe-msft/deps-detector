@@ -20,75 +20,170 @@ import (
 
 // jsonReport is the top-level JSON output structure when --json is used.
 type jsonReport struct {
-	VersionRange model.VersionRange        `json:"version_range"`
-	Repo         model.RepoRef             `json:"repo"`
-	RepoURL      string                    `json:"repo_url"`
-	Analyses     []analyzer.SourceAnalysis `json:"analyses"`
-	Result       *model.AnalysisResult     `json:"result"`
+	VersionRange    model.VersionRange        `json:"version_range"`
+	Repo            model.RepoRef             `json:"repo"`
+	RepoURL         string                    `json:"repo_url"`
+	IntegrityChecks []model.IntegrityCheck    `json:"integrity_checks,omitempty"`
+	Analyses        []analyzer.SourceAnalysis `json:"analyses"`
+	Result          *model.AnalysisResult     `json:"result"`
 }
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `deps-detector — supply chain risk auditor for dependency upgrades
 
 Usage:
-  deps-detector [--json] <language>:<module>@<fromVersion>..<toVersion>
+  deps-detector [flags] <language>:<module> --from <version> --to <version>
 
 Flags:
-  --json   Output the full report as JSON, including all agent analyses
+  --from <version>              Source version (required)
+  --to <version>                Target version (required)
+  --from-integrity <hash>       Expected integrity hash for --from version
+  --to-integrity <hash>         Expected integrity hash for --to version
+  --model <model>               LLM model to use (default: gpt-5.4-mini)
+  --json                        Output the full report as JSON
+
+When integrity values are provided, they are compared against the remote
+registry (e.g. sum.golang.org for Go). A mismatch indicates possible
+retagging and is flagged as a critical finding. When omitted, a warning
+is logged since retagging cannot be detected without known hashes.
 
 Examples:
-  deps-detector go:github.com/go-logr/logr@v1.4.1..v1.4.2
-  deps-detector --json go:github.com/go-logr/logr@v1.4.1..v1.4.2
+  deps-detector go:github.com/go-logr/logr --from v1.4.1 --to v1.4.2
+  deps-detector --json go:github.com/go-logr/logr --from v1.4.1 --to v1.4.2 \
+    --from-integrity h1:... --to-integrity h1:...
 
 Supported languages:
-  go   — resolves via proxy.golang.org
+  go   — resolves via proxy.golang.org, integrity via sum.golang.org
 
 Prerequisites:
   gh      — GitHub CLI, authenticated (used for fetching repo data)
   copilot — GitHub Copilot CLI (used for LLM analysis via the Copilot SDK)
 
 Environment variables:
-  LLM_MODEL        — Model to use (default: gpt-4o)
   COPILOT_CLI_PATH — Path to the Copilot CLI executable (optional)
 `)
 	os.Exit(1)
 }
 
-func main() {
-	args := os.Args[1:]
-	jsonOutput := false
+// cliArgs holds the parsed command-line arguments.
+type cliArgs struct {
+	pkg           string // "go:github.com/go-logr/logr"
+	from          string
+	to            string
+	fromIntegrity string
+	toIntegrity   string
+	model         string
+	jsonOutput    bool
+}
 
-	// Parse flags.
+func parseArgs(args []string) (*cliArgs, error) {
+	c := &cliArgs{}
 	var positional []string
-	for _, a := range args {
-		if a == "--json" {
-			jsonOutput = true
-		} else if strings.HasPrefix(a, "-") {
-			fmt.Fprintf(os.Stderr, "Unknown flag: %s\n\n", a)
-			usage()
-		} else {
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--json":
+			c.jsonOutput = true
+		case a == "--from":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--from requires a value")
+			}
+			i++
+			c.from = args[i]
+		case strings.HasPrefix(a, "--from="):
+			c.from = strings.TrimPrefix(a, "--from=")
+		case a == "--to":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--to requires a value")
+			}
+			i++
+			c.to = args[i]
+		case strings.HasPrefix(a, "--to="):
+			c.to = strings.TrimPrefix(a, "--to=")
+		case a == "--from-integrity":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--from-integrity requires a value")
+			}
+			i++
+			c.fromIntegrity = args[i]
+		case strings.HasPrefix(a, "--from-integrity="):
+			c.fromIntegrity = strings.TrimPrefix(a, "--from-integrity=")
+		case a == "--to-integrity":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--to-integrity requires a value")
+			}
+			i++
+			c.toIntegrity = args[i]
+		case strings.HasPrefix(a, "--to-integrity="):
+			c.toIntegrity = strings.TrimPrefix(a, "--to-integrity=")
+		case a == "--model":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--model requires a value")
+			}
+			i++
+			c.model = args[i]
+		case strings.HasPrefix(a, "--model="):
+			c.model = strings.TrimPrefix(a, "--model=")
+		case strings.HasPrefix(a, "-"):
+			return nil, fmt.Errorf("unknown flag: %s", a)
+		default:
 			positional = append(positional, a)
 		}
 	}
 
 	if len(positional) != 1 {
-		usage()
+		return nil, fmt.Errorf("expected exactly one positional argument (<language>:<module>), got %d", len(positional))
+	}
+	c.pkg = positional[0]
+
+	if c.from == "" {
+		return nil, fmt.Errorf("--from is required")
+	}
+	if c.to == "" {
+		return nil, fmt.Errorf("--to is required")
 	}
 
-	vr, err := parseInput(positional[0])
+	return c, nil
+}
+
+// parsePkg splits "go:github.com/go-logr/logr" into language and module.
+func parsePkg(pkg string) (language, module string, err error) {
+	idx := strings.Index(pkg, ":")
+	if idx < 1 {
+		return "", "", fmt.Errorf("missing language prefix, expected lang:module, got %q", pkg)
+	}
+	return pkg[:idx], pkg[idx+1:], nil
+}
+
+func main() {
+	cli, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		usage()
 	}
 
-	llmModel := os.Getenv("LLM_MODEL")
+	language, module, err := parsePkg(cli.pkg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+		usage()
+	}
+
+	vr := model.VersionRange{
+		Language: language,
+		Dep:      module,
+		From:     cli.from,
+		To:       cli.to,
+	}
+
+	llmModel := cli.model
 	if llmModel == "" {
-		llmModel = "gpt-4o"
+		llmModel = "gpt-5.4-mini"
 	}
 
 	// Progress messages go to stderr in JSON mode to keep stdout clean.
 	var progress io.Writer = os.Stdout
-	if jsonOutput {
+	if cli.jsonOutput {
 		progress = os.Stderr
 	}
 
@@ -108,7 +203,51 @@ func main() {
 
 	repo := resolved.Repo
 	fmt.Fprintf(progress, "  📦 Source: %s (%s)\n\n", resolved.RepoURL, repo)
-	fmt.Fprintf(progress, "🔍 Analyzing %s (%s..%s)\n\n", vr.Dep, vr.From, vr.To)
+
+	// Integrity checks.
+	var integrityChecks []model.IntegrityCheck
+	fmt.Fprintf(progress, "🔒 Checking integrity...\n")
+
+	type integrityInput struct {
+		version   string
+		localHash string
+		label     string
+	}
+	intInputs := []integrityInput{
+		{version: vr.From, localHash: cli.fromIntegrity, label: "from"},
+		{version: vr.To, localHash: cli.toIntegrity, label: "to"},
+	}
+
+	for _, ii := range intInputs {
+		result, err := registry.ValidateIntegrity(ctx, vr.Language, vr.Dep, ii.version, ii.localHash)
+		if err != nil {
+			fmt.Fprintf(progress, "  ⚠️  Could not fetch remote integrity for %s (%s): %v\n", ii.version, ii.label, err)
+			continue
+		}
+
+		check := model.IntegrityCheck{
+			Version:   ii.version,
+			Status:    result.Status,
+			Local:     result.Local,
+			Remote:    result.Remote.Hash,
+			RemoteMod: result.Remote.ModHash,
+		}
+
+		switch result.Status {
+		case model.IntegritySkipped:
+			fmt.Fprintf(progress, "  ⚠️  No --%s-integrity provided for %s — cannot detect retagging\n", ii.label, ii.version)
+		case model.IntegrityMatch:
+			fmt.Fprintf(progress, "  ✅ %s (%s): integrity match\n", ii.version, ii.label)
+		case model.IntegrityMismatch:
+			fmt.Fprintf(progress, "  🔴 %s (%s): INTEGRITY MISMATCH — possible retagging!\n", ii.version, ii.label)
+			fmt.Fprintf(progress, "     local:  %s\n", result.Local)
+			fmt.Fprintf(progress, "     remote: %s\n", result.Remote.Hash)
+		}
+
+		integrityChecks = append(integrityChecks, check)
+	}
+
+	fmt.Fprintf(progress, "\n🔍 Analyzing %s (%s..%s)\n\n", vr.Dep, vr.From, vr.To)
 
 	// Initialize info sources.
 	gh := github.NewClient()
@@ -224,13 +363,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	if jsonOutput {
+	// Inject integrity mismatch findings into the result.
+	for _, ic := range integrityChecks {
+		if ic.Status == model.IntegrityMismatch {
+			result.Findings = append(result.Findings, model.Finding{
+				Title:       fmt.Sprintf("Integrity mismatch for %s", ic.Version),
+				Description: fmt.Sprintf("The locally-known hash (%s) does not match the remote registry hash (%s). This may indicate the tag was deleted and re-pushed with different content (retagging attack).", ic.Local, ic.Remote),
+				Severity:    model.RiskCritical,
+				Source:      "integrity_check",
+			})
+			// Escalate overall risk level if a mismatch is found.
+			if result.RiskLevel == model.RiskNone || result.RiskLevel == model.RiskLow || result.RiskLevel == model.RiskMedium {
+				result.RiskLevel = model.RiskCritical
+			}
+		}
+	}
+
+	if cli.jsonOutput {
 		report := jsonReport{
-			VersionRange: vr,
-			Repo:         repo,
-			RepoURL:      resolved.RepoURL,
-			Analyses:     analyses,
-			Result:       result,
+			VersionRange:    vr,
+			Repo:            repo,
+			RepoURL:         resolved.RepoURL,
+			IntegrityChecks: integrityChecks,
+			Analyses:        analyses,
+			Result:          result,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -241,39 +397,6 @@ func main() {
 	} else {
 		printResult(vr, result)
 	}
-}
-
-// parseInput parses the CLI argument in the format "lang:module@from..to".
-// Example: "go:github.com/go-logr/logr@v1.4.1..v1.4.2"
-func parseInput(arg string) (model.VersionRange, error) {
-	// Split on first ":"  →  language, rest
-	colonIdx := strings.Index(arg, ":")
-	if colonIdx < 1 {
-		return model.VersionRange{}, fmt.Errorf("missing language prefix, expected lang:module@from..to, got %q", arg)
-	}
-	language := arg[:colonIdx]
-	rest := arg[colonIdx+1:] // "github.com/go-logr/logr@v1.4.1..v1.4.2"
-
-	// Split on "@"  →  module, versions
-	atIdx := strings.Index(rest, "@")
-	if atIdx < 1 {
-		return model.VersionRange{}, fmt.Errorf("missing version separator '@', expected lang:module@from..to, got %q", arg)
-	}
-	module := rest[:atIdx]
-	versions := rest[atIdx+1:] // "v1.4.1..v1.4.2"
-
-	// Split on ".."  →  from, to
-	parts := strings.SplitN(versions, "..", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return model.VersionRange{}, fmt.Errorf("invalid version range %q, expected from..to", versions)
-	}
-
-	return model.VersionRange{
-		Language: language,
-		Dep:      module,
-		From:     parts[0],
-		To:       parts[1],
-	}, nil
 }
 
 func printResult(vr model.VersionRange, result *model.AnalysisResult) {
