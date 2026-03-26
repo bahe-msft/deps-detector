@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -12,18 +14,34 @@ import (
 	"github.com/anomalyco/deps-check/internal/analyzer"
 	"github.com/anomalyco/deps-check/internal/github"
 	"github.com/anomalyco/deps-check/internal/model"
+	"github.com/anomalyco/deps-check/internal/resolve"
 	"github.com/anomalyco/deps-check/internal/source"
 )
+
+// jsonReport is the top-level JSON output structure when --json is used.
+type jsonReport struct {
+	VersionRange model.VersionRange        `json:"version_range"`
+	Repo         model.RepoRef             `json:"repo"`
+	RepoURL      string                    `json:"repo_url"`
+	Analyses     []analyzer.SourceAnalysis `json:"analyses"`
+	Result       *model.AnalysisResult     `json:"result"`
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `deps-detector — supply chain risk auditor for dependency upgrades
 
 Usage:
-  deps-detector <owner/repo> <fromVersion>..<toVersion>
+  deps-detector [--json] <language>:<module>@<fromVersion>..<toVersion>
+
+Flags:
+  --json   Output the full report as JSON, including all agent analyses
 
 Examples:
-  deps-detector golang/go v1.21.0..v1.22.0
-  deps-detector lodash/lodash 4.17.20..4.17.21
+  deps-detector go:github.com/go-logr/logr@v1.4.1..v1.4.2
+  deps-detector --json go:github.com/go-logr/logr@v1.4.1..v1.4.2
+
+Supported languages:
+  go   — resolves via proxy.golang.org
 
 Prerequisites:
   gh      — GitHub CLI, authenticated (used for fetching repo data)
@@ -37,17 +55,27 @@ Environment variables:
 }
 
 func main() {
-	if len(os.Args) != 3 {
+	args := os.Args[1:]
+	jsonOutput := false
+
+	// Parse flags.
+	var positional []string
+	for _, a := range args {
+		if a == "--json" {
+			jsonOutput = true
+		} else if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "Unknown flag: %s\n\n", a)
+			usage()
+		} else {
+			positional = append(positional, a)
+		}
+	}
+
+	if len(positional) != 1 {
 		usage()
 	}
 
-	repo, err := parseRepo(os.Args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
-		usage()
-	}
-
-	vr, err := parseVersionRange(os.Args[1], os.Args[2])
+	vr, err := parseInput(positional[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		usage()
@@ -58,9 +86,29 @@ func main() {
 		llmModel = "gpt-4o"
 	}
 
+	// Progress messages go to stderr in JSON mode to keep stdout clean.
+	var progress io.Writer = os.Stdout
+	if jsonOutput {
+		progress = os.Stderr
+	}
+
 	ctx := context.Background()
 
-	fmt.Printf("🔍 Analyzing %s (%s..%s)\n\n", repo, vr.From, vr.To)
+	// Resolve package to source repository.
+	registry := resolve.NewRegistry()
+	registry.Register(&resolve.GoResolver{})
+
+	fmt.Fprintf(progress, "🔍 Resolving %s:%s\n", vr.Language, vr.Dep)
+
+	resolved, err := registry.Resolve(ctx, vr.Language, vr.Dep, vr.To)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving package: %v\n", err)
+		os.Exit(1)
+	}
+
+	repo := resolved.Repo
+	fmt.Fprintf(progress, "  📦 Source: %s (%s)\n\n", resolved.RepoURL, repo)
+	fmt.Fprintf(progress, "🔍 Analyzing %s (%s..%s)\n\n", vr.Dep, vr.From, vr.To)
 
 	// Initialize info sources.
 	gh := github.NewClient()
@@ -86,7 +134,7 @@ func main() {
 		wg.Add(1)
 		go func(s source.InfoSource) {
 			defer wg.Done()
-			fmt.Printf("  ⏳ Gathering from %s...\n", s.Name())
+			fmt.Fprintf(progress, "  ⏳ Gathering from %s...\n", s.Name())
 			r, err := s.Gather(ctx, repo, vr)
 			mu.Lock()
 			defer mu.Unlock()
@@ -94,14 +142,14 @@ func main() {
 				gatherErrs = append(gatherErrs, fmt.Errorf("%s: %w", s.Name(), err))
 			} else {
 				results = append(results, sourceResult{name: s.Name(), reports: r})
-				fmt.Printf("  ✅ %s: %d report(s)\n", s.Name(), len(r))
+				fmt.Fprintf(progress, "  ✅ %s: %d report(s)\n", s.Name(), len(r))
 			}
 		}(src)
 	}
 	wg.Wait()
 
 	for _, e := range gatherErrs {
-		fmt.Printf("  ⚠️  %v\n", e)
+		fmt.Fprintf(progress, "  ⚠️  %v\n", e)
 	}
 
 	if len(results) == 0 {
@@ -127,7 +175,7 @@ func main() {
 	}
 
 	// Phase 1: Run per-source analysis agents concurrently.
-	fmt.Printf("\n🤖 Running analysis agents...\n\n")
+	fmt.Fprintf(progress, "\n🤖 Running analysis agents...\n\n")
 
 	var (
 		analyses  []analyzer.SourceAnalysis
@@ -144,7 +192,7 @@ func main() {
 		wg.Add(1)
 		go func(a analyzer.Agent, name string, reports []model.ChangeReport) {
 			defer wg.Done()
-			fmt.Printf("  🤖 [%s] Analyzing...\n", a.Name())
+			fmt.Fprintf(progress, "  🤖 [%s] Analyzing...\n", a.Name())
 
 			text, err := a.Analyze(ctx, vr, reports)
 
@@ -152,10 +200,10 @@ func main() {
 			defer mu.Unlock()
 			if err != nil {
 				agentErrs = append(agentErrs, fmt.Errorf("agent %s: %w", a.Name(), err))
-				fmt.Printf("  ⚠️  [%s] Failed: %v\n", a.Name(), err)
+				fmt.Fprintf(progress, "  ⚠️  [%s] Failed: %v\n", a.Name(), err)
 			} else {
 				analyses = append(analyses, analyzer.SourceAnalysis{Source: name, Analysis: text})
-				fmt.Printf("  ✅ [%s] Done\n", a.Name())
+				fmt.Fprintf(progress, "  ✅ [%s] Done\n", a.Name())
 			}
 		}(agent, sr.name, sr.reports)
 	}
@@ -167,7 +215,7 @@ func main() {
 	}
 
 	// Phase 2: Summarizer agent consolidates all analyses.
-	fmt.Printf("\n  🤖 [summarizer] Consolidating analyses...\n")
+	fmt.Fprintf(progress, "\n  🤖 [summarizer] Consolidating analyses...\n")
 	summarizer := analyzer.NewSummarizerAgent(client, llmModel)
 
 	result, err := summarizer.Summarize(ctx, vr, analyses)
@@ -176,26 +224,55 @@ func main() {
 		os.Exit(1)
 	}
 
-	printResult(vr, result)
+	if jsonOutput {
+		report := jsonReport{
+			VersionRange: vr,
+			Repo:         repo,
+			RepoURL:      resolved.RepoURL,
+			Analyses:     analyses,
+			Result:       result,
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(report); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		printResult(vr, result)
+	}
 }
 
-func parseRepo(arg string) (model.RepoRef, error) {
-	parts := strings.SplitN(arg, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return model.RepoRef{}, fmt.Errorf("invalid repo format %q, expected owner/repo", arg)
+// parseInput parses the CLI argument in the format "lang:module@from..to".
+// Example: "go:github.com/go-logr/logr@v1.4.1..v1.4.2"
+func parseInput(arg string) (model.VersionRange, error) {
+	// Split on first ":"  →  language, rest
+	colonIdx := strings.Index(arg, ":")
+	if colonIdx < 1 {
+		return model.VersionRange{}, fmt.Errorf("missing language prefix, expected lang:module@from..to, got %q", arg)
 	}
-	return model.RepoRef{Owner: parts[0], Repo: parts[1]}, nil
-}
+	language := arg[:colonIdx]
+	rest := arg[colonIdx+1:] // "github.com/go-logr/logr@v1.4.1..v1.4.2"
 
-func parseVersionRange(dep, versionArg string) (model.VersionRange, error) {
-	parts := strings.SplitN(versionArg, "..", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return model.VersionRange{}, fmt.Errorf("invalid version range %q, expected v1.2.3..v1.2.4", versionArg)
+	// Split on "@"  →  module, versions
+	atIdx := strings.Index(rest, "@")
+	if atIdx < 1 {
+		return model.VersionRange{}, fmt.Errorf("missing version separator '@', expected lang:module@from..to, got %q", arg)
 	}
+	module := rest[:atIdx]
+	versions := rest[atIdx+1:] // "v1.4.1..v1.4.2"
+
+	// Split on ".."  →  from, to
+	parts := strings.SplitN(versions, "..", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return model.VersionRange{}, fmt.Errorf("invalid version range %q, expected from..to", versions)
+	}
+
 	return model.VersionRange{
-		Dep:  dep,
-		From: parts[0],
-		To:   parts[1],
+		Language: language,
+		Dep:      module,
+		From:     parts[0],
+		To:       parts[1],
 	}, nil
 }
 

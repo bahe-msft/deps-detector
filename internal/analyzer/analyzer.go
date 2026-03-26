@@ -16,8 +16,8 @@ import (
 
 // SourceAnalysis holds the free-form text output from a sub-task agent.
 type SourceAnalysis struct {
-	Source   string // name of the source that was analyzed
-	Analysis string // free-form text analysis
+	Source   string `json:"source"`   // name of the source that was analyzed
+	Analysis string `json:"analysis"` // free-form text analysis
 }
 
 // Agent analyzes change reports from a single info source and returns
